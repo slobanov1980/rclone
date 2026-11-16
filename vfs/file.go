@@ -248,40 +248,43 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 
 		f.mu.RLock()
 		o := f.o
-		d := f.d
 		f.mu.RUnlock()
 		var newObject fs.Object
 		// if o is nil then are writing the file so no need to rename the object
 		if o != nil {
 			if o.Remote() == newPath {
-				return nil // no need to rename
-			}
+				newObject = o
+			} else {
+				// do the move of the remote object
+				dstOverwritten, _ := destDir.Fs().NewObject(ctx, newPath)
+				newObject, err = operations.Move(ctx, destDir.Fs(), dstOverwritten, newPath, o)
+				if err != nil {
+					fs.Errorf(f.Path(), "File.Rename error: %v", err)
+					return err
+				}
 
-			// do the move of the remote object
-			dstOverwritten, _ := d.Fs().NewObject(ctx, newPath)
-			newObject, err = operations.Move(ctx, d.Fs(), dstOverwritten, newPath, o)
-			if err != nil {
-				fs.Errorf(f.Path(), "File.Rename error: %v", err)
-				return err
-			}
-
-			// newObject can be nil here for example if --dry-run
-			if newObject == nil {
-				err = errors.New("rename failed: nil object returned")
-				fs.Errorf(f.Path(), "File.Rename %v", err)
-				return err
+				// newObject can be nil here for example if --dry-run
+				if newObject == nil {
+					err = errors.New("rename failed: nil object returned")
+					fs.Errorf(f.Path(), "File.Rename %v", err)
+					return err
+				}
 			}
 		}
 		// Rename in the cache
-		if d.vfs.cache != nil && d.vfs.cache.Exists(oldPath) {
-			if err := d.vfs.cache.Rename(oldPath, newPath, newObject); err != nil {
-				fs.Infof(f.Path(), "File.Rename failed in Cache: %v", err)
+		if destDir.vfs.cache != nil && destDir.vfs.cache.Exists(oldPath) {
+			if err := destDir.vfs.cache.Rename(oldPath, newPath, newObject); err != nil {
+				fs.Errorf(f.Path(), "File.Rename failed in Cache: %v", err)
+				return err
 			}
 		}
 		// Update the node with the new details
 		fs.Debugf(f.Path(), "Updating file with %v %p", newObject, f)
 		// f.rename(destDir, newObject)
 		f.mu.Lock()
+		f.d = destDir
+		f.dPath = destDir.Path()
+		f.leaf = newName
 		if newObject != nil {
 			f.o = newObject
 			f._setIsLink()
@@ -293,12 +296,9 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 
 	// rename the file object
 	dPath := destDir.Path()
-	f.mu.Lock()
-	f.d = destDir
-	f.dPath = dPath
-	f.leaf = newName
+	f.mu.RLock()
 	writing := f._writingInProgress()
-	f.mu.Unlock()
+	f.mu.RUnlock()
 
 	// Delay the rename if not using RW caching. For the minimal case we
 	// need to look in the cache to see if caching is in use.
@@ -308,6 +308,9 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 			(CacheMode == vfscommon.CacheModeMinimal && !destDir.vfs.cache.Exists(oldPath))) {
 		fs.Debugf(oldPath, "File is currently open, delaying rename %p", f)
 		f.mu.Lock()
+		f.d = destDir
+		f.dPath = dPath
+		f.leaf = newName
 		f.pendingRenameFun = renameCall
 		f.mu.Unlock()
 		return nil
@@ -495,6 +498,10 @@ func (f *File) _applyPendingModTime() error {
 	switch err {
 	case nil:
 		fs.Debugf(f.o, "Applied pending mod time %v OK", f.pendingModTime)
+		// Refresh cache fingerprint/modtime so subsequent opens do not discard cached data as stale (#10281).
+		if f.d.vfs.cache != nil && f.d.vfs.cache.Exists(f._cachePath()) {
+			f.d.vfs.cache.SetModTime(f._cachePath(), f.pendingModTime)
+		}
 	case fs.ErrorCantSetModTime, fs.ErrorCantSetModTimeWithoutDelete:
 		// do nothing, in order to not break "touch somefile" if it exists already
 	default:

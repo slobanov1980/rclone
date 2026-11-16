@@ -411,7 +411,7 @@ func rename(osOldPath, osNewPath string) error {
 			return nil
 		}
 	}
-	if err = os.Rename(osOldPath, osNewPath); err != nil {
+	if err = osRenameReplace(osOldPath, osNewPath); err != nil {
 		return fmt.Errorf("failed to rename in cache: %s to %s: %w", osOldPath, osNewPath, err)
 	}
 	return nil
@@ -419,19 +419,38 @@ func rename(osOldPath, osNewPath string) error {
 
 // Rename the item in cache
 func (c *Cache) Rename(name string, newName string, newObj fs.Object) (err error) {
+	if name != newName {
+		c.mu.Lock()
+		existing := c.item[newName]
+		c.mu.Unlock()
+		if existing != nil {
+			existing.quiesceForOverwrite()
+		}
+	}
+
 	item, _ := c.get(name)
 	err = item.rename(name, newName, newObj)
 	if err != nil {
 		return err
 	}
 
-	// Move the item in the cache
+	// Move the item in the cache and retire any superseded destination item
+	var superseded *Item
 	c.mu.Lock()
-	if item, ok := c.item[name]; ok {
-		c.item[newName] = item
+	if existing, ok := c.item[newName]; ok && existing != item {
+		superseded = existing
+	}
+	if cur, ok := c.item[name]; ok {
+		c.item[newName] = cur
 		delete(c.item, name)
+	} else {
+		c.item[newName] = item
 	}
 	c.mu.Unlock()
+
+	if superseded != nil {
+		superseded.markSuperseded()
+	}
 
 	fs.Infof(name, "vfs cache: renamed in cache to %q", newName)
 	return nil
