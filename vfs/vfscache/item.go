@@ -71,6 +71,8 @@ type Item struct {
 	beingReset      bool                     // cache cleaner is resetting the cache file, access not allowed
 	graceTimer      *time.Timer              // timer for delayed close after grace period
 	closing         chan struct{}            // non-nil while a grace-period close is tearing the handle down, closed when done
+	superseded      bool                     // true once overwritten in Cache.Rename; suppresses stale metadata/writeback writes
+	lastStoreFn     StoreFn                  // last close callback for re-queuing dirty items across renames
 }
 
 // Info is persisted to backing store
@@ -634,6 +636,9 @@ func unlockMutexForCall(mu *sync.Mutex, f func()) {
 // Call with lock held
 func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 	// defer log.Trace(item.name, "item=%p", item)("err=%v", &err)
+	if item.superseded {
+		return context.Canceled
+	}
 
 	// Transfer the temp file to the remote
 	cacheObj, err := item.c.fcache.NewObject(ctx, item.name)
@@ -647,6 +652,9 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 		unlockMutexForCall(&item.mu, func() {
 			o, err = operations.Copy(ctx, item.c.fremote, o, name, cacheObj)
 		})
+		if item.superseded {
+			return context.Canceled
+		}
 		if err != nil {
 			if errors.Is(err, fs.ErrorCantUploadEmptyFiles) {
 				fs.Errorf(name, "Writeback failed: %v", err)
@@ -661,13 +669,16 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 	// Write the object back to the VFS layer before we mark it as
 	// clean, otherwise it will become eligible for removal which
 	// can cause a deadlock
-	if storeFn != nil && item.o != nil {
+	if storeFn != nil && item.o != nil && !item.superseded {
 		fs.Debugf(item.name, "vfs cache: writeback object to VFS layer")
 		// Write the object back to the VFS layer last with mutex unlocked
 		o := item.o
 		item.mu.Unlock()
 		storeFn(o)
 		item.mu.Lock()
+	}
+	if item.superseded {
+		return context.Canceled
 	}
 
 	// Show item is clean and is eligible for cache removal
@@ -697,6 +708,9 @@ func (item *Item) Close(storeFn StoreFn) (err error) {
 	item.mu.Lock()
 	defer item.mu.Unlock()
 
+	if storeFn != nil {
+		item.lastStoreFn = storeFn
+	}
 	item.info.ATime = time.Now()
 	item.opens--
 
@@ -709,7 +723,7 @@ func (item *Item) Close(storeFn StoreFn) (err error) {
 	// opens == 0: check for grace period (only for non-dirty files,
 	// dirty files need immediate close so writeback can proceed)
 	gracePeriod := time.Duration(item.c.opt.HandleCaching)
-	if gracePeriod > 0 && !item.info.Dirty {
+	if gracePeriod > 0 && !item.info.Dirty && !item.superseded {
 		item.graceTimer = time.AfterFunc(gracePeriod, item.closeAfterGrace)
 		return nil
 	}
@@ -804,6 +818,14 @@ func (item *Item) _actualClose(storeFn StoreFn, syncWriteBack bool) (err error) 
 	} else {
 		checkErr(item.fd.Close())
 		item.fd = nil
+	}
+
+	// If this Item was superseded by an atomic Cache.Rename while a reader still
+	// held it open, never overwrite the replacement version's vfsMeta, modtime,
+	// or writeback queue entry on disk.
+	if item.superseded {
+		item.modified = false
+		return err
 	}
 
 	// save the metadata once more since it may be dirty
@@ -1533,39 +1555,138 @@ func (item *Item) Sync() (err error) {
 	return nil
 }
 
-// rename the item
+// quiesceForOverwrite releases idle cached file handles and cancels any active
+// in-flight writeback upload on an item that is about to be overwritten in Cache.Rename,
+// while keeping its writeback handle queued in case the incoming rename fails.
+func (item *Item) quiesceForOverwrite() {
+	item.preAccess()
+	defer item.postAccess()
+
+	item.mu.Lock()
+	if item.graceTimer != nil {
+		item.graceTimer.Stop()
+		item.graceTimer = nil
+	}
+	var dls *downloaders.Downloaders
+	if item.opens == 0 {
+		dls = item.downloaders
+		item.downloaders = nil
+		if item.fd != nil {
+			_ = item.fd.Close()
+			item.fd = nil
+		}
+	}
+	wbID := item.writeBackID
+	item.mu.Unlock()
+
+	if dls != nil {
+		_ = dls.Close(nil)
+	}
+	if wbID != 0 {
+		item.c.writeback.CancelUpload(wbID)
+	}
+}
+
+// markSuperseded retires an Item after Cache.Rename atomically replaced its cache key.
+func (item *Item) markSuperseded() {
+	item.mu.Lock()
+	wbID := item.writeBackID
+	item.superseded = true
+	item.info.Dirty = false
+	item.writeBackID = 0
+	if item.graceTimer != nil {
+		item.graceTimer.Stop()
+		item.graceTimer = nil
+	}
+	var dls *downloaders.Downloaders
+	if item.opens == 0 {
+		dls = item.downloaders
+		item.downloaders = nil
+		if item.fd != nil {
+			_ = item.fd.Close()
+			item.fd = nil
+		}
+	}
+	item.mu.Unlock()
+
+	if dls != nil {
+		_ = dls.Close(nil)
+	}
+	if wbID != 0 {
+		item.c.writeback.Remove(wbID)
+	}
+}
+
+// rename the item transactionally without mutating in-memory state on OS rename error.
 func (item *Item) rename(name string, newName string, newObj fs.Object) (err error) {
 	item.preAccess()
 	defer item.postAccess()
-	item.mu.Lock()
 
-	// stop downloader
+	item.mu.Lock()
+	if item.graceTimer != nil {
+		item.graceTimer.Stop()
+		item.graceTimer = nil
+	}
 	downloaders := item.downloaders
 	item.downloaders = nil
-
-	// id for writeback cancel
-	id := item.writeBackID
-
-	// Set internal state
-	item.name = newName
-	item.o = newObj
-	item._updateFingerprint()
-
-	// Rename cache file if it exists
-	err = rename(item.c.toOSPath(name), item.c.toOSPath(newName)) // No locking in Cache
-
-	// Rename meta file if it exists
-	err2 := rename(item.c.toOSPathMeta(name), item.c.toOSPathMeta(newName)) // No locking in Cache
-	if err2 != nil {
-		err = err2
+	if item.opens == 0 && item.fd != nil {
+		_ = item.fd.Close()
+		item.fd = nil
 	}
-
+	id := item.writeBackID
 	item.mu.Unlock()
 
-	// close downloader and cancel writebacks with mutex unlocked
+	// Close downloaders and pause any in-flight writeback upload with item.mu unlocked
+	// (writeback.mu must never be acquired while item.mu is held).
 	if downloaders != nil {
 		_ = downloaders.Close(nil)
 	}
+	if id != 0 {
+		item.c.writeback.CancelUpload(id)
+	}
+
+	item.mu.Lock()
+	osOldData := item.c.toOSPath(name)
+	osNewData := item.c.toOSPath(newName)
+	osOldMeta := item.c.toOSPathMeta(name)
+	osNewMeta := item.c.toOSPathMeta(newName)
+	_, dstStatErr := os.Stat(osNewData)
+	destExisted := (dstStatErr == nil)
+
+	if err = rename(osOldData, osNewData); err != nil {
+		item.mu.Unlock()
+		return err
+	}
+
+	if err2 := rename(osOldMeta, osNewMeta); err2 != nil {
+		if !destExisted {
+			_ = rename(osNewData, osOldData)
+		}
+		item.mu.Unlock()
+		return err2
+	}
+
+	// Commit internal state only after both cache data and metadata renames succeeded
+	item.name = newName
+	item.o = newObj
+	item._updateFingerprint()
+	if item._exists() {
+		_ = item._save()
+	}
+	dirty := item.info.Dirty
+	size := item.info.Size
+	storeFn := item.lastStoreFn
+	item.mu.Unlock()
+
 	item.c.writeback.Rename(id, newName)
-	return err
+	if dirty && (id == 0 || !item.c.writeback.Has(id)) {
+		item.mu.Lock()
+		item.c.writeback.SetID(&item.writeBackID)
+		newID := item.writeBackID
+		item.mu.Unlock()
+		item.c.writeback.Add(newID, newName, size, true, func(ctx context.Context) error {
+			return item.store(ctx, storeFn)
+		})
+	}
+	return nil
 }

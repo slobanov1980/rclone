@@ -316,21 +316,22 @@ func (wb *WriteBack) Rename(id Handle, name string) {
 	wb.mu.Lock()
 	defer wb.mu.Unlock()
 
+	// Check to see if there are any uploads with the existing
+	// name and remove them even if the incoming item has no writeback handle.
+	for existingID, existingItem := range wb.lookup {
+		if existingID != id && existingItem.name == name {
+			wb._remove(existingID)
+		}
+	}
+
 	wbItem, ok := wb.lookup[id]
 	if !ok {
+		wb._resetTimer()
 		return
 	}
 	if wbItem.uploading {
 		// We are uploading already so cancel the upload
 		wb._cancelUpload(wbItem)
-	}
-
-	// Check to see if there are any uploads with the existing
-	// name and remove them
-	for existingID, existingItem := range wb.lookup {
-		if existingID != id && existingItem.name == name {
-			wb._remove(existingID)
-		}
 	}
 
 	wbItem.name = name
@@ -423,6 +424,26 @@ func (wb *WriteBack) cancelUpload(id Handle) bool {
 	}
 	wb._cancelUpload(wbItem)
 	return true
+}
+
+// CancelUpload cancels an in-progress upload for id while keeping the item queued
+// in writeback so a failed rename never strands a dirty item unqueued.
+func (wb *WriteBack) CancelUpload(id Handle) bool {
+	if id == 0 {
+		return false
+	}
+	return wb.cancelUpload(id)
+}
+
+// Has reports whether id is currently tracked in the writeback lookup table.
+func (wb *WriteBack) Has(id Handle) bool {
+	if id == 0 {
+		return false
+	}
+	wb.mu.Lock()
+	defer wb.mu.Unlock()
+	_, ok := wb.lookup[id]
+	return ok
 }
 
 // this uploads as many items as possible
